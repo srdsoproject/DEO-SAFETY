@@ -55,7 +55,7 @@ import requests
 import railway_safety_unified as rs
 
 st.set_page_config(
-    page_title="S.A.R.A.L Inspection App",
+    page_title="DEO CHA S.A.R.A.L Inspection App",
     layout="wide",
     initial_sidebar_state="auto",  # collapsed on mobile by default in many clients
     menu_items={
