@@ -1466,6 +1466,48 @@ if st.session_state.df is None:
 # =========================================================================
 tabs = st.tabs(["📝 View Records", "📊 Analytics", "📨 Inspections", " 💡Smart Analysis"])
 
+# =========================================================================
+# 1) NEW HELPER  – put this near your other helpers (next to update_feedback_column)
+#    Writes ONLY the changed cells, for any column, to Google Sheets.
+# =========================================================================
+import gspread  # already imported in your app, keep once at the top of the file
+
+EDITABLE_COLS = [
+    "Date of Inspection", "Type of Inspection", "Head", "Sub Head", "Location",
+    "Deficiencies Noted", "Inspection By", "Action By", "Feedback",
+    "User Feedback/Remark", TIMESTAMP_COL_NAME,
+]  # "Status" is calculated from Feedback, so it stays read-only
+
+
+def update_cells_in_sheet(cell_changes):
+    """
+    cell_changes: list of dicts -> {"row": <sheet row number>, "col": <column name>, "value": <str>}
+    """
+    if not cell_changes:
+        return
+    # >>> Use the SAME worksheet object that update_feedback_column() uses <<<
+    ws = get_worksheet()            # <-- replace with however your app opens the sheet
+    headers = ws.row_values(1)
+    col_idx = {h.strip(): i + 1 for i, h in enumerate(headers)}
+
+    cells = []
+    for ch in cell_changes:
+        if ch["col"] in col_idx:
+            cells.append(gspread.Cell(int(ch["row"]), col_idx[ch["col"]], ch["value"]))
+    if cells:
+        ws.update_cells(cells, value_input_option="USER_ENTERED")
+
+
+def _norm_for_compare(df_, col):
+    """Normalise a column to comparable plain strings (dates -> YYYY-MM-DD)."""
+    if col == "Date of Inspection":
+        return pd.to_datetime(df_[col], errors="coerce").dt.strftime("%Y-%m-%d").fillna("")
+    return df_[col].fillna("").astype(str).str.strip()
+
+
+# =========================================================================
+# 2) THE TAB
+# =========================================================================
 with tabs[0]:
     df = st.session_state.df
     if df is None or df.empty:
@@ -1525,7 +1567,6 @@ with tabs[0]:
             sel_from, sel_to = sel_to, sel_from
         dr = f"{sel_from.strftime('%d-%m-%Y')} to {sel_to.strftime('%d-%m-%Y')}"
     elif not filtered.empty and not filtered["Date of Inspection"].isna().all():
-        # Fallback: actual span of rows currently shown
         dr = (
             f"{filtered['Date of Inspection'].min().strftime('%d-%m-%Y')} to "
             f"{filtered['Date of Inspection'].max().strftime('%d-%m-%Y')}"
@@ -1602,10 +1643,12 @@ with tabs[0]:
 
         editable_df = editable_filtered[valid_cols + ["_original_sheet_index", "_sheet_row"]].copy()
 
+        # Date shown as plain text (YYYY-MM-DD) so it can be typed/edited in the grid
         if "Date of Inspection" in editable_df.columns:
-            editable_df["Date of Inspection"] = pd.to_datetime(
-                editable_df["Date of Inspection"], errors="coerce"
-            ).dt.date
+            editable_df["Date of Inspection"] = (
+                pd.to_datetime(editable_df["Date of Inspection"], errors="coerce")
+                .dt.strftime("%Y-%m-%d").fillna("")
+            )
 
         if "Feedback" in editable_df.columns and "User Feedback/Remark" in editable_df.columns:
             editable_df.insert(
@@ -1679,27 +1722,28 @@ with tabs[0]:
         # ---- AgGrid configuration ----
         grid_display_df = editable_df.drop(columns=["_status_plain"], errors="ignore")
         gb = GridOptionsBuilder.from_dataframe(grid_display_df)
-        
-        # flex=1 is the default "share" every column gets of the available width;
-        # columns below override that share so wide/narrow content is proportioned
-        # sensibly, but everything still always fits the screen width.
+
+        # EVERY column is editable by default (text editor, wraps, auto height)
         gb.configure_default_column(
-            editable=False,
+            editable=True,
             wrapText=True,
             autoHeight=True,
             resizable=True,
             suppressMovable=False,
+            cellEditor="agLargeTextCellEditor",
+            cellEditorPopup=True,
+            cellEditorParams={"maxLength": 4000, "rows": 6, "cols": 50},
             flex=1,
             minWidth=90,
         )
-        
+
         col_flex = {
             "Date of Inspection": (1.0, 110),
             "Type of Inspection": (1.2, 140),
             "Head": (1.0, 110),
             "Sub Head": (1.2, 130),
             "Location": (1.0, 100),
-            "Deficiencies Noted": (3.0, 260),   # gets the most room, but still bounded
+            "Deficiencies Noted": (3.0, 260),
             "Inspection By": (1.3, 140),
             "Action By": (1.3, 140),
             "Feedback": (1.5, 160),
@@ -1710,28 +1754,27 @@ with tabs[0]:
         for col_name, (flex_val, min_w) in col_flex.items():
             if col_name in grid_display_df.columns:
                 gb.configure_column(col_name, flex=flex_val, minWidth=min_w)
-        
-        if "User Feedback/Remark" in grid_display_df.columns:
-            gb.configure_column(
-                "User Feedback/Remark",
-                editable=True, wrapText=True, autoHeight=True,
-                cellEditor="agTextCellEditor", cellEditorPopup=False,
-                cellEditorParams={"maxLength": 4000},
-                flex=2, minWidth=180,
-            )
-        
-        gb.configure_column("_original_sheet_index", hide=True)
-        gb.configure_column("_sheet_row", hide=True)
+
+        # Status is calculated from Feedback / Remark -> read-only
+        if "Status" in grid_display_df.columns:
+            gb.configure_column("Status", editable=False)
+
+        gb.configure_column("_original_sheet_index", hide=True, editable=False)
+        gb.configure_column("_sheet_row", hide=True, editable=False)
         gb.configure_grid_options(
             singleClickEdit=True,
             suppressHorizontalScroll=False,
-            enableCellTextSelection=False,   # or just delete this line
+            enableCellTextSelection=False,
             ensureDomOrder=True,
+            stopEditingWhenCellsLoseFocus=True,
         )
         grid_options = gb.build()
-        
+
         st.markdown("#### 🚈 Inspection Details")
-        st.caption("Type your compliance in 'User Feedback/Remark' column. Use column headers to sort. Columns auto-fit the screen width — drag a header edge if you'd still like to fine-tune one.")
+        st.caption(
+            "All fields are editable (click a cell to edit). Status is automatic. "
+            "Dates must be in YYYY-MM-DD format. Click '✅ Submit Changes' to save."
+        )
         grid_response = AgGrid(
             grid_display_df,
             gridOptions=grid_options,
@@ -1747,7 +1790,9 @@ with tabs[0]:
         export_cols = [c for c in valid_cols if c not in ["_original_sheet_index", "_sheet_row"]]
         export_edited_df = edited_df[export_cols].copy()
         export_edited_df["Status"] = edited_df["Status"].apply(strip_status_emoji)
-        export_edited_df["Date of Inspection"] = pd.to_datetime(export_edited_df["Date of Inspection"]).dt.date
+        export_edited_df["Date of Inspection"] = pd.to_datetime(
+            export_edited_df["Date of Inspection"], errors="coerce"
+        ).dt.date
 
         st.download_button(
             label="📥 Export Edited Records to Excel",
@@ -1759,7 +1804,7 @@ with tabs[0]:
 
         # ---- Buttons ----
         b1, b2 = st.columns(2)
-        submitted = b1.button("✅ Submit Feedback", use_container_width=True)
+        submitted = b1.button("✅ Submit Changes", use_container_width=True)
         refresh_clicked = b2.button("🔄 Refresh Data", use_container_width=True)
 
         if refresh_clicked:
@@ -1774,46 +1819,85 @@ with tabs[0]:
             else:
                 st.session_state.feedback_submitting = True
                 try:
-                    with st.spinner("💾 Saving feedback to Google Sheet... Please do not refresh or close the page."):
-                        need_cols = {"_original_sheet_index", "User Feedback/Remark"}
-                        if not need_cols.issubset(edited_df.columns) or "Feedback" not in editable_filtered.columns:
+                    with st.spinner("💾 Saving changes to Google Sheet... Please do not refresh or close the page."):
+                        if "_original_sheet_index" not in edited_df.columns:
                             st.error("⚠️ Required columns are missing from the data.")
                         else:
                             orig = editable_filtered.set_index("_original_sheet_index")
                             new_df = edited_df.set_index("_original_sheet_index")
 
-                            old_remarks = orig["User Feedback/Remark"].fillna("").astype(str)
-                            new_remarks = new_df["User Feedback/Remark"].fillna("").astype(str)
+                            common_ids = new_df.index.intersection(orig.index)
+                            cols_to_check = [c for c in EDITABLE_COLS
+                                             if c in valid_cols and c in new_df.columns and c in orig.columns]
 
-                            common_ids = new_remarks.index.intersection(old_remarks.index)
-                            diff_mask = new_remarks.loc[common_ids] != old_remarks.loc[common_ids]
-                            changed_ids = diff_mask[diff_mask].index.tolist()
+                            cell_changes = []      # what gets written to Google Sheets
+                            changed_rows = set()
+                            invalid_dates = []
 
-                            if changed_ids:
-                                diffs = new_df.loc[changed_ids].copy()
-                                diffs["_sheet_row"] = orig.loc[changed_ids, "_sheet_row"].values
+                            for col in cols_to_check:
+                                old_vals = _norm_for_compare(orig.loc[common_ids], col)
+                                new_vals = _norm_for_compare(new_df.loc[common_ids], col)
+                                diff_ids = old_vals.index[old_vals != new_vals].tolist()
 
-                                for oid in changed_ids:
-                                    user_remark = new_df.loc[oid, "User Feedback/Remark"].strip()
-                                    if not user_remark:
-                                        continue
-                                    # Copy the remark into Feedback and clear the remark field
-                                    diffs.at[oid, "Feedback"] = user_remark
-                                    diffs.at[oid, "User Feedback/Remark"] = ""
-                                    st.session_state.df.at[oid, "Feedback"] = user_remark
-                                    st.session_state.df.at[oid, "User Feedback/Remark"] = ""
+                                for oid in diff_ids:
+                                    new_val = new_vals.loc[oid]
 
-                                update_feedback_column(diffs.reset_index())
-                                st.success(f"✅ Successfully updated {len(changed_ids)} record(s)!")
+                                    # validate dates
+                                    if col == "Date of Inspection" and new_val:
+                                        if pd.isna(pd.to_datetime(new_val, errors="coerce")):
+                                            invalid_dates.append(new_val)
+                                            continue
+
+                                    cell_changes.append({
+                                        "oid": oid,
+                                        "row": int(orig.loc[oid, "_sheet_row"]),
+                                        "col": col,
+                                        "value": new_val,
+                                    })
+                                    changed_rows.add(oid)
+
+                            if invalid_dates:
+                                st.error(f"❌ Invalid date(s): {', '.join(sorted(set(invalid_dates)))}. Use YYYY-MM-DD.")
                             else:
-                                st.info("ℹ️ No changes detected in the feedback.")
+                                # Workflow kept from before: a typed remark moves into Feedback
+                                # (unless Feedback itself was edited in the same row) and the remark is cleared.
+                                feedback_edited = {c["oid"] for c in cell_changes if c["col"] == "Feedback"}
+                                for ch in list(cell_changes):
+                                    if (ch["col"] == "User Feedback/Remark" and ch["value"]
+                                            and ch["oid"] not in feedback_edited):
+                                        cell_changes.append({
+                                            "oid": ch["oid"], "row": ch["row"],
+                                            "col": "Feedback", "value": ch["value"],
+                                        })
+                                        ch["value"] = ""   # clear remark in the sheet
+
+                                if cell_changes:
+                                    # keep only the last value per (row, column)
+                                    final = {}
+                                    for ch in cell_changes:
+                                        final[(ch["row"], ch["col"])] = ch
+                                    cell_changes = list(final.values())
+
+                                    update_cells_in_sheet(cell_changes)
+
+                                    # keep session data in sync
+                                    for ch in cell_changes:
+                                        val = ch["value"]
+                                        if ch["col"] == "Date of Inspection":
+                                            val = pd.to_datetime(val, errors="coerce")
+                                        if ch["oid"] in st.session_state.df.index:
+                                            st.session_state.df.at[ch["oid"], ch["col"]] = val
+
+                                    st.success(f"✅ Successfully updated {len(changed_rows)} record(s)!")
+                                    st.rerun()
+                                else:
+                                    st.info("ℹ️ No changes detected.")
                 except Exception as e:
                     st.error(f"❌ Error during submission: {str(e)}")
                 finally:
                     st.session_state.feedback_submitting = False
     else:
         st.info("No deficiencies available to update at the moment.")
-
 # =========================================================================
 # FOOTER
 # =========================================================================
