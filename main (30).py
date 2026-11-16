@@ -1502,7 +1502,185 @@ def _norm_for_compare(df_, col):
 # =========================================================================
 # 2) THE TAB
 # =========================================================================
-with tabs[0]:
+# =========================================================================
+# TAB 5 – HQ SAFETY ABNORMALITY REPORT  (single self-contained block)
+# Only 2 things needed outside this block:
+#   1) tabs = st.tabs([..., "📧 HQ Report"])      -> this block is tabs[4]
+#   2) requirements.txt  ->  python-docx
+# Template: upload the Word file to the GitHub repo (same folder as this app file).
+# =========================================================================
+with tabs[4]:
+    import copy, io, smtplib
+    from datetime import date as _date
+    from pathlib import Path
+    from email import encoders
+    from email.mime.base import MIMEBase
+    from email.mime.multipart import MIMEMultipart
+    from email.mime.text import MIMEText
+    from docx import Document
+
+    W_NS = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+    HQ_COLUMN_MAP = {            # template heading -> database sheet column
+        "Date": "Date of Inspection",
+        "Location": "Location",
+        "Deficiencies Noted": "Deficiencies Noted",
+        "Inspection By": "Inspection By",
+        "Action By": "Action By",
+    }
+
+    def hq_find_template():
+        """Finds the Word template in the repo (app folder, ./templates, or working dir)."""
+        try:
+            base = Path(__file__).resolve().parent
+        except NameError:
+            base = Path.cwd()
+        for folder in (base, base / "templates", Path.cwd(), Path.cwd() / "templates"):
+            if folder.is_dir():
+                for f in sorted(folder.glob("*.docx")):
+                    if "hq" in f.name.lower() and "abnormality" in f.name.lower() and not f.name.startswith("~$"):
+                        return f
+        return None
+
+    def hq_rows_for_date(data, d):
+        if data is None or data.empty:
+            return pd.DataFrame(columns=list(HQ_COLUMN_MAP.values()))
+        dd = pd.to_datetime(data["Date of Inspection"], errors="coerce").dt.date
+        out = data[dd == d].copy()
+        for c in HQ_COLUMN_MAP.values():
+            if c not in out.columns:
+                out[c] = ""
+        return out
+
+    def hq_set_cell(cell, text):
+        para = cell.paragraphs[0]
+        runs = para.runs
+        for r in runs[1:]:
+            r._r.getparent().remove(r._r)
+        run = runs[0]
+        if run._r.rPr is not None:                       # remove bold copied from header
+            for t in ("b", "bCs"):
+                for el in run._r.rPr.findall(W_NS + t):
+                    run._r.rPr.remove(el)
+        lines = str(text).replace("\r", "").split("\n")
+        run.text = lines[0]
+        for ln in lines[1:]:
+            run.add_break()
+            run.add_text(ln)
+
+    def hq_build_docx(rows, d, template):
+        doc = Document(str(template))
+        for p in doc.paragraphs:                          # title date
+            for r in p.runs:
+                if "YYYY-MM-DD" in r.text:
+                    r.text = r.text.replace("YYYY-MM-DD", d.isoformat())
+        table = doc.tables[0]
+        header_tr = table.rows[0]._tr
+        headings = [c.text.strip() for c in table.rows[0].cells]
+        for _, rec in rows.iterrows():                    # one row per deficiency, no serial no.
+            header_tr.getparent().append(copy.deepcopy(header_tr))
+            for cell, head in zip(table.rows[-1].cells, headings):
+                src = HQ_COLUMN_MAP.get(head)
+                val = rec.get(src, "") if src else ""
+                if src == "Date of Inspection":
+                    val = "" if pd.isna(val) else pd.Timestamp(val).strftime("%d-%m-%Y")
+                elif pd.isna(val):
+                    val = ""
+                hq_set_cell(cell, str(val).strip())
+        buf = io.BytesIO()
+        doc.save(buf)
+        return buf.getvalue()
+
+    def hq_send_mail(sender, password, recipient, subject, body, file_bytes, filename):
+        recipients = [r.strip() for r in str(recipient).replace(";", ",").split(",") if r.strip()]
+        if not recipients:
+            return False, "No recipient configured."
+        msg = MIMEMultipart()
+        msg["From"], msg["To"], msg["Subject"] = sender, ", ".join(recipients), subject
+        msg.attach(MIMEText(body, "plain"))
+        part = MIMEBase("application", "vnd.openxmlformats-officedocument.wordprocessingml.document")
+        part.set_payload(file_bytes)
+        encoders.encode_base64(part)
+        part.add_header("Content-Disposition", f'attachment; filename="{filename}"')
+        msg.attach(part)
+        server = None
+        try:
+            server = smtplib.SMTP("smtp.gmail.com", 587, timeout=30)
+            server.starttls()
+            server.login(sender, password)
+            server.send_message(msg)
+            return True, "Email sent successfully."
+        except smtplib.SMTPAuthenticationError:
+            return False, "Authentication failed – check sender e-mail / Gmail App Password in secrets."
+        except Exception as e:
+            return False, f"Failed to send email: {e}"
+        finally:
+            if server is not None:
+                try:
+                    server.quit()
+                except Exception:
+                    pass
+
+    # ----------------------------- UI -----------------------------
+    st.markdown("### 📧 HQ Safety Abnormality Report")
+    st.caption("Pick a date → Generate (pulls the latest data from the database sheet) → Send to HQ.")
+
+    c1, c2 = st.columns(2)
+    report_date = c1.date_input("Report date (Date of Inspection)", value=_date.today(), key="hq_report_date")
+    gen_clicked = c2.button("📄 Generate Report", use_container_width=True, key="hq_generate")
+
+    if gen_clicked:
+        template = hq_find_template()
+        if template is None:
+            st.error("❌ Word template not found. Upload the HQ Safety abnormality report .docx to the GitHub repo.")
+        else:
+            with st.spinner("Syncing with Google Sheet and building report..."):
+                st.session_state.df = load_data()
+                rows = hq_rows_for_date(st.session_state.df, report_date)
+                if rows.empty:
+                    st.session_state.pop("hq_report", None)
+                    st.warning(f"No inspection records found for {report_date.strftime('%d-%m-%Y')}.")
+                else:
+                    st.session_state["hq_report"] = {
+                        "date": report_date,
+                        "rows": rows,
+                        "bytes": hq_build_docx(rows, report_date, template),
+                        "name": f"HQ Safety abnormality report on {report_date.isoformat()}.docx",
+                    }
+
+    rep = st.session_state.get("hq_report")
+    if rep and rep["date"] == report_date:
+        preview = rep["rows"][list(HQ_COLUMN_MAP.values())].copy()
+        preview["Date of Inspection"] = pd.to_datetime(preview["Date of Inspection"]).dt.strftime("%d-%m-%Y")
+        st.success(f"✅ Report ready: **{rep['name']}** ({len(preview)} record(s))")
+        st.dataframe(preview, use_container_width=True, hide_index=True)
+
+        d1, d2 = st.columns(2)
+        d1.download_button(
+            "⬇️ Download Word file", data=rep["bytes"], file_name=rep["name"],
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            use_container_width=True, key="hq_download",
+        )
+        confirm = st.checkbox("I have checked the report and want to send it to HQ", key="hq_confirm")
+        if d2.button("📨 Send to HQ", use_container_width=True, disabled=not confirm, key="hq_send"):
+            if st.session_state.get("hq_sending"):
+                st.warning("⏳ Already sending, please wait...")
+            else:
+                st.session_state.hq_sending = True
+                try:
+                    with st.spinner("Sending email..."):
+                        cfg = st.secrets["email"]
+                        ok, msg = hq_send_mail(
+                            cfg["sender"], cfg["password"], cfg["recipient"],
+                            f"SUR DIVN Safety Abnormality Report on dated {report_date.isoformat()}",
+                            "", rep["bytes"], rep["name"],
+                        )
+                    (st.success if ok else st.error)(("✅ " if ok else "❌ ") + msg)
+                except KeyError:
+                    st.error("❌ Missing [email] sender / password / recipient in Streamlit secrets.")
+                finally:
+                    st.session_state.hq_sending = False
+
+    with tabs[0]:
     df = st.session_state.df
     if df is None or df.empty:
         st.warning("No data available. Please check Google Sheets connection or refresh.")
@@ -3052,180 +3230,3 @@ with tabs[3]:
     
     st.markdown("---")
     st.caption("Source: SARAL · Solapur Division, Central Railway · Generated via Streamlit UI")
-# =========================================================================
-# TAB 5 – HQ SAFETY ABNORMALITY REPORT  (single self-contained block)
-# Only 2 things needed outside this block:
-#   1) tabs = st.tabs([..., "📧 HQ Report"])      -> this block is tabs[4]
-#   2) requirements.txt  ->  python-docx
-# Template: upload the Word file to the GitHub repo (same folder as this app file).
-# =========================================================================
-with tabs[4]:
-    import copy, io, smtplib
-    from datetime import date as _date
-    from pathlib import Path
-    from email import encoders
-    from email.mime.base import MIMEBase
-    from email.mime.multipart import MIMEMultipart
-    from email.mime.text import MIMEText
-    from docx import Document
-
-    W_NS = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
-    HQ_COLUMN_MAP = {            # template heading -> database sheet column
-        "Date": "Date of Inspection",
-        "Location": "Location",
-        "Deficiencies Noted": "Deficiencies Noted",
-        "Inspection By": "Inspection By",
-        "Action By": "Action By",
-    }
-
-    def hq_find_template():
-        """Finds the Word template in the repo (app folder, ./templates, or working dir)."""
-        try:
-            base = Path(__file__).resolve().parent
-        except NameError:
-            base = Path.cwd()
-        for folder in (base, base / "templates", Path.cwd(), Path.cwd() / "templates"):
-            if folder.is_dir():
-                for f in sorted(folder.glob("*.docx")):
-                    if "hq" in f.name.lower() and "abnormality" in f.name.lower() and not f.name.startswith("~$"):
-                        return f
-        return None
-
-    def hq_rows_for_date(data, d):
-        if data is None or data.empty:
-            return pd.DataFrame(columns=list(HQ_COLUMN_MAP.values()))
-        dd = pd.to_datetime(data["Date of Inspection"], errors="coerce").dt.date
-        out = data[dd == d].copy()
-        for c in HQ_COLUMN_MAP.values():
-            if c not in out.columns:
-                out[c] = ""
-        return out
-
-    def hq_set_cell(cell, text):
-        para = cell.paragraphs[0]
-        runs = para.runs
-        for r in runs[1:]:
-            r._r.getparent().remove(r._r)
-        run = runs[0]
-        if run._r.rPr is not None:                       # remove bold copied from header
-            for t in ("b", "bCs"):
-                for el in run._r.rPr.findall(W_NS + t):
-                    run._r.rPr.remove(el)
-        lines = str(text).replace("\r", "").split("\n")
-        run.text = lines[0]
-        for ln in lines[1:]:
-            run.add_break()
-            run.add_text(ln)
-
-    def hq_build_docx(rows, d, template):
-        doc = Document(str(template))
-        for p in doc.paragraphs:                          # title date
-            for r in p.runs:
-                if "YYYY-MM-DD" in r.text:
-                    r.text = r.text.replace("YYYY-MM-DD", d.isoformat())
-        table = doc.tables[0]
-        header_tr = table.rows[0]._tr
-        headings = [c.text.strip() for c in table.rows[0].cells]
-        for _, rec in rows.iterrows():                    # one row per deficiency, no serial no.
-            header_tr.getparent().append(copy.deepcopy(header_tr))
-            for cell, head in zip(table.rows[-1].cells, headings):
-                src = HQ_COLUMN_MAP.get(head)
-                val = rec.get(src, "") if src else ""
-                if src == "Date of Inspection":
-                    val = "" if pd.isna(val) else pd.Timestamp(val).strftime("%d-%m-%Y")
-                elif pd.isna(val):
-                    val = ""
-                hq_set_cell(cell, str(val).strip())
-        buf = io.BytesIO()
-        doc.save(buf)
-        return buf.getvalue()
-
-    def hq_send_mail(sender, password, recipient, subject, body, file_bytes, filename):
-        recipients = [r.strip() for r in str(recipient).replace(";", ",").split(",") if r.strip()]
-        if not recipients:
-            return False, "No recipient configured."
-        msg = MIMEMultipart()
-        msg["From"], msg["To"], msg["Subject"] = sender, ", ".join(recipients), subject
-        msg.attach(MIMEText(body, "plain"))
-        part = MIMEBase("application", "vnd.openxmlformats-officedocument.wordprocessingml.document")
-        part.set_payload(file_bytes)
-        encoders.encode_base64(part)
-        part.add_header("Content-Disposition", f'attachment; filename="{filename}"')
-        msg.attach(part)
-        server = None
-        try:
-            server = smtplib.SMTP("smtp.gmail.com", 587, timeout=30)
-            server.starttls()
-            server.login(sender, password)
-            server.send_message(msg)
-            return True, "Email sent successfully."
-        except smtplib.SMTPAuthenticationError:
-            return False, "Authentication failed – check sender e-mail / Gmail App Password in secrets."
-        except Exception as e:
-            return False, f"Failed to send email: {e}"
-        finally:
-            if server is not None:
-                try:
-                    server.quit()
-                except Exception:
-                    pass
-
-    # ----------------------------- UI -----------------------------
-    st.markdown("### 📧 HQ Safety Abnormality Report")
-    st.caption("Pick a date → Generate (pulls the latest data from the database sheet) → Send to HQ.")
-
-    c1, c2 = st.columns(2)
-    report_date = c1.date_input("Report date (Date of Inspection)", value=_date.today(), key="hq_report_date")
-    gen_clicked = c2.button("📄 Generate Report", use_container_width=True, key="hq_generate")
-
-    if gen_clicked:
-        template = hq_find_template()
-        if template is None:
-            st.error("❌ Word template not found. Upload the HQ Safety abnormality report .docx to the GitHub repo.")
-        else:
-            with st.spinner("Syncing with Google Sheet and building report..."):
-                st.session_state.df = load_data()
-                rows = hq_rows_for_date(st.session_state.df, report_date)
-                if rows.empty:
-                    st.session_state.pop("hq_report", None)
-                    st.warning(f"No inspection records found for {report_date.strftime('%d-%m-%Y')}.")
-                else:
-                    st.session_state["hq_report"] = {
-                        "date": report_date,
-                        "rows": rows,
-                        "bytes": hq_build_docx(rows, report_date, template),
-                        "name": f"HQ Safety abnormality report on {report_date.isoformat()}.docx",
-                    }
-
-    rep = st.session_state.get("hq_report")
-    if rep and rep["date"] == report_date:
-        preview = rep["rows"][list(HQ_COLUMN_MAP.values())].copy()
-        preview["Date of Inspection"] = pd.to_datetime(preview["Date of Inspection"]).dt.strftime("%d-%m-%Y")
-        st.success(f"✅ Report ready: **{rep['name']}** ({len(preview)} record(s))")
-        st.dataframe(preview, use_container_width=True, hide_index=True)
-
-        d1, d2 = st.columns(2)
-        d1.download_button(
-            "⬇️ Download Word file", data=rep["bytes"], file_name=rep["name"],
-            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            use_container_width=True, key="hq_download",
-        )
-        confirm = st.checkbox("I have checked the report and want to send it to HQ", key="hq_confirm")
-        if d2.button("📨 Send to HQ", use_container_width=True, disabled=not confirm, key="hq_send"):
-            if st.session_state.get("hq_sending"):
-                st.warning("⏳ Already sending, please wait...")
-            else:
-                st.session_state.hq_sending = True
-                try:
-                    with st.spinner("Sending email..."):
-                        cfg = st.secrets["email"]
-                        ok, msg = hq_send_mail(
-                            cfg["sender"], cfg["password"], cfg["recipient"],
-                            f"SUR DIVN Safety Abnormality Report on dated {report_date.isoformat()}",
-                            "", rep["bytes"], rep["name"],
-                        )
-                    (st.success if ok else st.error)(("✅ " if ok else "❌ ") + msg)
-                except KeyError:
-                    st.error("❌ Missing [email] sender / password / recipient in Streamlit secrets.")
-                finally:
-                    st.session_state.hq_sending = False
