@@ -1461,15 +1461,9 @@ def load_data():
 if st.session_state.df is None:
     st.session_state.df = load_data()
 
-# =========================================================================
-# MAIN TABS
-# =========================================================================
-tabs = st.tabs(["📝 View Records", "📊 Analytics", "📨 Inspections", " 💡Smart Analysis"])
 
-# =========================================================================
-# 1) NEW HELPER  – put this near your other helpers (next to update_feedback_column)
-#    Writes ONLY the changed cells, for any column, to Google Sheets.
-# =========================================================================
+tabs = st.tabs(["📝 View Records", "📊 Analytics", "📨 Inspections", " 💡Smart Analysis", "📧 HQ Report"])
+
 import gspread  # already imported in your app, keep once at the top of the file
 
 EDITABLE_COLS = [
