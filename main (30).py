@@ -1486,7 +1486,7 @@ def update_cells_in_sheet(cell_changes):
     if not cell_changes:
         return
     # >>> Use the SAME worksheet object that update_feedback_column() uses <<<
-    ws = get_worksheet()            # <-- replace with however your app opens the sheet
+    ws = sheet           # <-- replace with however your app opens the sheet
     headers = ws.row_values(1)
     col_idx = {h.strip(): i + 1 for i, h in enumerate(headers)}
 
